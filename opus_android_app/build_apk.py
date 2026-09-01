@@ -1,4 +1,8 @@
-import os,shutil,subprocess,sys,zipfile
+import os
+import shutil
+import subprocess
+import sys
+import zipfile
 from pathlib import Path
 
 # Enable ANSI colors on Windows console
@@ -10,83 +14,31 @@ GREEN = "\033[92m"
 RED = "\033[91m"
 CYAN = "\033[96m"
 
-# --- Project Paths ---
+# Path Configuration
+EXPORT_ROOT = Path(r"F:\Gaming\Godot\Requirements\AndroidExport")
+SDK_ROOT = EXPORT_ROOT / "sdk"
+JAVA_HOME = EXPORT_ROOT / "java"
+JAVA_BIN = JAVA_HOME / "bin"
+
+# Export JAVA_HOME and inject java/bin into PATH so d8.bat and apksigner.bat can locate java
+os.environ["JAVA_HOME"] = str(JAVA_HOME)
+os.environ["PATH"] = f"{JAVA_BIN};{os.environ.get('PATH', '')}"
+
+NDK_BIN_DIR = (
+    SDK_ROOT
+    / r"ndk\23.2.8568313\toolchains\llvm\prebuilt\windows-x86_64\bin"
+)
+NDK_CLANG = NDK_BIN_DIR / "aarch64-linux-android28-clang.cmd"
+NDK_AR = NDK_BIN_DIR / "llvm-ar.exe"
+
 PROJECT_ROOT = Path(__file__).resolve().parent
+OPUS_SRC_DIR = PROJECT_ROOT / "opus-1.5.2"
 BUILD_DIR = PROJECT_ROOT / "build"
 SRC_DIR = PROJECT_ROOT / "src"
 RES_DIR = PROJECT_ROOT / "res"
 JNI_DIR = PROJECT_ROOT / "jni"
 MANIFEST_FILE = PROJECT_ROOT / "AndroidManifest.xml"
 KEYSTORE_FILE = BUILD_DIR / "debug.keystore"
-
-# Auto-detect any Opus folder (e.g., opus-1.5.2, opus-1.4, etc.)
-opus_matches = sorted(PROJECT_ROOT.glob("opus*"))
-OPUS_SRC_DIR = (
-    opus_matches[0] if opus_matches else PROJECT_ROOT / "opus"
-)
-
-# --- Standard SDK & Java Resolution ---
-# 1. Look for standard environment variables, fallback to default OS install locations
-DEFAULT_SDK = (
-    Path.home() / "AppData" / "Local" / "Android" / "Sdk"
-    if sys.platform == "win32"
-    else Path.home() / "Android" / "Sdk"
-)
-
-SDK_ROOT = Path(
-    os.environ.get("ANDROID_HOME")
-    or os.environ.get("ANDROID_SDK_ROOT")
-    or DEFAULT_SDK
-)
-
-# 2. JAVA_HOME detection (Env var -> Android Studio bundled JBR -> Fallback)
-JAVA_HOME = Path(
-    os.environ.get("JAVA_HOME")
-    or (SDK_ROOT / "jbr")
-    or (SDK_ROOT / "jre")
-)
-JAVA_BIN = JAVA_HOME / "bin"
-
-# Export JAVA_HOME and prepend java/bin cross-platform
-os.environ["JAVA_HOME"] = str(JAVA_HOME)
-os.environ["PATH"] = f"{JAVA_BIN}{os.pathsep}{os.environ.get('PATH', '')}"
-
-# --- Dynamic NDK & Toolchain Resolution ---
-API_LEVEL = 28
-IS_WINDOWS = sys.platform == "win32"
-CMD_EXT = ".cmd" if IS_WINDOWS else ""
-EXE_EXT = ".exe" if IS_WINDOWS else ""
-
-# 3. Locate NDK: Env var -> latest installed version in SDK/ndk
-ndk_base = Path(
-    os.environ.get("ANDROID_NDK_HOME")
-    or os.environ.get("NDK_HOME")
-    or (SDK_ROOT / "ndk")
-)
-
-if ndk_base.exists() and ndk_base.is_dir():
-    # Pick the latest version directory if subfolders exist
-    installed_versions = sorted([d for d in ndk_base.iterdir() if d.is_dir()])
-    NDK_ROOT = installed_versions[-1] if installed_versions else ndk_base
-else:
-    NDK_ROOT = ndk_base
-
-# 4. Resolve the LLVM prebuilt host folder (e.g., windows-x86_64, linux-x86_64, darwin-x86_64)
-prebuilt_base = NDK_ROOT / "toolchains" / "llvm" / "prebuilt"
-prebuilt_hosts = (
-    list(prebuilt_base.glob("*")) if prebuilt_base.exists() else []
-)
-NDK_BIN_DIR = (
-    prebuilt_hosts[0] / "bin"
-    if prebuilt_hosts
-    else prebuilt_base / "windows-x86_64" / "bin"
-)
-
-# 5. Compiler toolchain paths
-NDK_CLANG = (
-    NDK_BIN_DIR / f"aarch64-linux-android{API_LEVEL}-clang{CMD_EXT}"
-)
-NDK_AR = NDK_BIN_DIR / f"llvm-ar{EXE_EXT}"
 
 
 def log_info(msg: str):

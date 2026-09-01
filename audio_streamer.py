@@ -1,5 +1,8 @@
-import os, sys
+import os
+import sys
+import traceback, threading
 
+# Register DLL directory for both standard Python and PyInstaller onefile bundles
 _BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
 if hasattr(os, "add_dll_directory") and os.path.isdir(_BASE_DIR):
     try:
@@ -11,17 +14,76 @@ os.environ["PATH"] = _BASE_DIR + os.pathsep + os.environ.get("PATH", "")
 import ctypes
 from ctypes import wintypes
 
+# -----------------------------------------------------------------------------
+# Crash & Diagnostic Modal Handler
+# -----------------------------------------------------------------------------
+def show_fatal_crash_dialog(title: str, error_msg: str):
+    """Displays a native, modal Windows error dialog with the exhaustive stack trace."""
+    user32 = ctypes.windll.user32
+    # MB_OK (0x0) | MB_ICONERROR (0x10) | MB_SYSTEMMODAL (0x1000) | MB_SETFOREGROUND (0x10000)
+    flags = 0x00000000 | 0x00000010 | 0x00001000 | 0x00010000
+    user32.MessageBoxW(0, error_msg, title, flags)
+
+
+def handle_unhandled_exception(exc_type, exc_value, exc_traceback):
+    """Global exception hook catching all uncaught crashes across main and worker threads."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+
+    tb_lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
+    full_traceback = "".join(tb_lines)
+
+    diagnostic_report = (
+        f"AN UNRECOVERABLE CRASH OCCURRED IN {APP_NAME}\n\n"
+        f"Exception Type: {exc_type.__name__}\n"
+        f"Exception Details: {exc_value}\n\n"
+        f"--- Exhaustive Stack Trace ---\n"
+        f"{full_traceback}\n"
+        f"--- System Environment ---\n"
+        f"Python: {sys.version}\n"
+        f"Working Directory: {os.getcwd()}\n"
+        f"Executable Path: {sys.executable}"
+    )
+
+    try:
+        show_fatal_crash_dialog(f"{APP_NAME} - Fatal Crash Error", diagnostic_report)
+    except Exception:
+        pass
+
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+    sys.exit(1)
+
+
+sys.excepthook = handle_unhandled_exception
+if hasattr(threading, "excepthook"):
+    threading.excepthook = lambda args: handle_unhandled_exception(
+        args.exc_type, args.exc_value, args.exc_traceback
+    )
+
+# -----------------------------------------------------------------------------
+# Single Instance Guard (Win32 Named Mutex)
+# -----------------------------------------------------------------------------
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 CreateMutexW = kernel32.CreateMutexW
 CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
 CreateMutexW.restype = wintypes.HANDLE
 
-MUTEX_NAME = "Local\\AndroidAudioStreamer_Clean_9927"
+MUTEX_NAME = "Local\\AndroidAudioStreamer_CleanStream_9928"
 _SINGLE_INSTANCE_MUTEX = CreateMutexW(None, False, MUTEX_NAME)
 if kernel32.GetLastError() == 183:
     sys.exit(0)
 
-import queue, socket, subprocess,threading, time, winreg, numpy as np, opuslib, pyaudiowpatch as pyaudio, pystray
+import queue
+import socket
+import subprocess
+import threading
+import time
+import winreg
+import numpy as np
+import opuslib
+import pyaudiowpatch as pyaudio
+import pystray
 from PIL import Image, ImageDraw
 
 APP_NAME = "AndroidAudioStreamer"
@@ -31,6 +93,7 @@ OPUS_FRAME_DURATION_MS = 20  # 20ms = 960 samples @ 48kHz
 SAMPLES_PER_FRAME = int(TARGET_SAMPLE_RATE * (OPUS_FRAME_DURATION_MS / 1000.0))
 BYTES_PER_OPUS_FRAME = SAMPLES_PER_FRAME * 2 * 2
 OPUS_BITRATE = 128000
+
 
 def is_startup_enabled() -> bool:
     try:
@@ -68,7 +131,6 @@ def set_startup(enable: bool):
 
 
 def get_single_broadcast_target():
-    """Identifies the single best subnet broadcast address to eliminate packet multiplication/echo."""
     subnets = set()
     try:
         hostname = socket.gethostname()
@@ -79,7 +141,6 @@ def get_single_broadcast_target():
                     subnets.add(f"{parts[0]}.{parts[1]}.{parts[2]}.255")
     except Exception:
         pass
-
     return list(subnets) if subnets else ["255.255.255.255"]
 
 
@@ -94,12 +155,14 @@ class MultiDeviceAudioStreamer:
         self._stop_event = threading.Event()
         self._worker_thread = None
         self._sender_thread = None
-        self._packet_queue = queue.Queue(maxsize=8)
+        self._packet_queue = queue.Queue(maxsize=32)
 
         self.udp_sock = None
         self.audio_interface = None
         self.stream = None
         self.encoder = None
+
+        self._current_device_name = ""
 
     def start(self):
         self._stop_event.clear()
@@ -113,7 +176,8 @@ class MultiDeviceAudioStreamer:
 
     def stop(self):
         self._stop_event.set()
-        self._cleanup()
+        self._cleanup_audio_session()
+        self._cleanup_network()
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=1.5)
         if self._sender_thread and self._sender_thread.is_alive():
@@ -122,11 +186,10 @@ class MultiDeviceAudioStreamer:
 
     def toggle_pause(self):
         self.is_paused = not self.is_paused
-        self.status_text = "Paused" if self.is_paused else "Broadcasting"
+        self.status_text = "Paused" if self.is_paused else f"Broadcasting ({self._current_device_name})"
 
-    def _cleanup(self):
-        self.is_running = False
-
+    def _cleanup_audio_session(self):
+        """Cleanly releases sound capture handles so new devices can bind immediately."""
         if self.stream:
             try:
                 self.stream.stop_stream()
@@ -142,6 +205,8 @@ class MultiDeviceAudioStreamer:
                 pass
             self.audio_interface = None
 
+    def _cleanup_network(self):
+        self.is_running = False
         if self.udp_sock:
             try:
                 self.udp_sock.close()
@@ -178,9 +243,34 @@ class MultiDeviceAudioStreamer:
                 except Exception:
                     pass
 
+    def _find_default_loopback_device(self, p_audio):
+        """Resolves the currently active Windows default WASAPI playback device and its loopback."""
+        wasapi_info = p_audio.get_host_api_info_by_type(pyaudio.paWASAPI)
+        default_output_index = wasapi_info.get("defaultOutputDevice", -1)
+        if default_output_index == -1:
+            raise RuntimeError("No active default WASAPI output device detected in Windows.")
+
+        default_speakers = p_audio.get_device_info_by_index(default_output_index)
+        loopback_device = None
+
+        if not default_speakers.get("isLoopbackDevice", False):
+            for loopback in p_audio.get_loopback_device_info_generator():
+                if default_speakers["name"] in loopback["name"]:
+                    loopback_device = loopback
+                    break
+            if not loopback_device:
+                loopback_device = p_audio.get_default_wasapi_loopback()
+        else:
+            loopback_device = default_speakers
+
+        if not loopback_device:
+            raise RuntimeError(f"Could not initialize WASAPI loopback for '{default_speakers.get('name', 'Unknown')}'")
+
+        return default_speakers, loopback_device
+
     def _run_streamer(self):
         try:
-            # Prevent double-audio: kill any rogue standalone binary on USB devices
+            # Terminate any conflicting standalone binary on USB devices
             subprocess.run(
                 ["adb", "shell", "killall -9 audio_player 2>/dev/null; exit 0"],
                 capture_output=True,
@@ -194,7 +284,7 @@ class MultiDeviceAudioStreamer:
 
             self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
+            self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
             self.udp_sock.setblocking(False)
 
             self._sender_thread = threading.Thread(
@@ -202,152 +292,175 @@ class MultiDeviceAudioStreamer:
             )
             self._sender_thread.start()
 
-            self.audio_interface = pyaudio.PyAudio()
-            wasapi_info = self.audio_interface.get_host_api_info_by_type(pyaudio.paWASAPI)
-            default_speakers = self.audio_interface.get_device_info_by_index(
-                wasapi_info["defaultOutputDevice"]
-            )
+            # -----------------------------------------------------------------
+            # Self-Recovery Loop: Automatically adapts to sound device changes
+            # -----------------------------------------------------------------
+            while not self._stop_event.is_set():
+                self._cleanup_audio_session()
 
-            loopback_device = None
-            if not default_speakers["isLoopbackDevice"]:
-                for loopback in self.audio_interface.get_loopback_device_info_generator():
-                    if default_speakers["name"] in loopback["name"]:
-                        loopback_device = loopback
-                        break
-                if not loopback_device:
-                    loopback_device = self.audio_interface.get_default_wasapi_loopback()
-            else:
-                loopback_device = default_speakers
+                try:
+                    self.audio_interface = pyaudio.PyAudio()
+                    default_speakers, loopback_device = self._find_default_loopback_device(self.audio_interface)
+                except Exception as dev_err:
+                    self.status_text = "Searching for audio device..."
+                    self._cleanup_audio_session()
+                    time.sleep(1.0)
+                    continue
 
-            in_rate = int(loopback_device["defaultSampleRate"])
-            in_channels = loopback_device["maxInputChannels"]
+                clean_name = default_speakers["name"].split("(")[0].strip()
+                self._current_device_name = clean_name
+                active_device_index = default_speakers["index"]
 
-            if in_channels == 1:
-                downmix_matrix = np.array([[1.0, 1.0]], dtype=np.float32)
-            elif in_channels == 2:
-                downmix_matrix = None
-            elif in_channels == 6:
-                downmix_matrix = np.array([
-                    [0.5,    0.0],
-                    [0.0,    0.5],
-                    [0.3535, 0.3535],
-                    [0.5,    0.5],
-                    [0.3535, 0.0],
-                    [0.0,    0.3535],
-                ], dtype=np.float32)
-            elif in_channels == 8:
-                downmix_matrix = np.array([
-                    [0.45,   0.0],
-                    [0.0,    0.45],
-                    [0.318,  0.318],
-                    [0.45,   0.45],
-                    [0.318,  0.0],
-                    [0.0,    0.318],
-                    [0.318,  0.0],
-                    [0.0,    0.318],
-                ], dtype=np.float32)
-            else:
-                downmix_matrix = "slice"
+                in_rate = int(loopback_device["defaultSampleRate"])
+                in_channels = loopback_device["maxInputChannels"]
 
-            pcm_accumulator = bytearray()
-            phase_acc = 0.0
-            prev_samples = np.zeros((1, 2), dtype=np.float32)
+                # Vectorized Matrix Setup for Multichannel Downmixing
+                if in_channels == 1:
+                    downmix_matrix = np.array([[1.0, 1.0]], dtype=np.float32)
+                elif in_channels == 2:
+                    downmix_matrix = None
+                elif in_channels == 6:
+                    downmix_matrix = np.array([
+                        [0.5,    0.0],
+                        [0.0,    0.5],
+                        [0.3535, 0.3535],
+                        [0.5,    0.5],
+                        [0.3535, 0.0],
+                        [0.0,    0.3535],
+                    ], dtype=np.float32)
+                elif in_channels == 8:
+                    downmix_matrix = np.array([
+                        [0.45,   0.0],
+                        [0.0,    0.45],
+                        [0.318,  0.318],
+                        [0.45,   0.45],
+                        [0.318,  0.0],
+                        [0.0,    0.318],
+                        [0.318,  0.0],
+                        [0.0,    0.318],
+                    ], dtype=np.float32)
+                else:
+                    downmix_matrix = "slice"
 
-            def audio_callback(in_data, frame_count, time_info, status):
-                nonlocal phase_acc, prev_samples, pcm_accumulator
+                pcm_accumulator = bytearray()
+                phase_acc = 0.0
+                prev_samples = np.zeros((1, 2), dtype=np.float32)
+                stream_failed_event = threading.Event()
 
-                if self._stop_event.is_set():
-                    return (None, pyaudio.paAbort)
+                def audio_callback(in_data, frame_count, time_info, status):
+                    nonlocal phase_acc, prev_samples, pcm_accumulator
 
-                if self.is_paused:
-                    if len(pcm_accumulator) > 0:
-                        pcm_accumulator.clear()
+                    if self._stop_event.is_set() or stream_failed_event.is_set():
+                        return (None, pyaudio.paAbort)
+
+                    if self.is_paused:
+                        if len(pcm_accumulator) > 0:
+                            pcm_accumulator.clear()
+                        return (None, pyaudio.paContinue)
+
+                    try:
+                        audio_data = np.frombuffer(in_data, dtype=np.float32)
+                        if audio_data.size == 0:
+                            return (None, pyaudio.paContinue)
+
+                        audio_data = audio_data.reshape(-1, in_channels)
+
+                        if downmix_matrix is None:
+                            stereo = audio_data
+                        elif downmix_matrix == "slice":
+                            stereo = audio_data[:, :2]
+                        else:
+                            stereo = audio_data @ downmix_matrix
+
+                        if in_rate != self.target_rate:
+                            ext_stereo = np.vstack((prev_samples, stereo))
+                            step = in_rate / self.target_rate
+                            num_out = int(np.floor((len(stereo) - phase_acc) / step))
+
+                            if num_out > 0:
+                                indices = phase_acc + np.arange(num_out, dtype=np.float32) * step
+                                i_floor = indices.astype(np.int32)
+                                frac = (indices - i_floor).reshape(-1, 1)
+
+                                stereo_resampled = (1.0 - frac) * ext_stereo[i_floor] + frac * ext_stereo[i_floor + 1]
+                                phase_acc = float(indices[-1] + step - len(stereo))
+                            else:
+                                phase_acc -= len(stereo)
+                                return (None, pyaudio.paContinue)
+
+                            prev_samples = ext_stereo[-1:]
+                        else:
+                            stereo_resampled = stereo
+
+                        stereo_clamped = np.clip(stereo_resampled, -1.0, 1.0)
+                        pcm_bytes = (stereo_clamped * 32767.0).astype(np.int16).tobytes()
+                        pcm_accumulator.extend(pcm_bytes)
+
+                        while len(pcm_accumulator) >= BYTES_PER_OPUS_FRAME:
+                            frame_bytes = bytes(pcm_accumulator[:BYTES_PER_OPUS_FRAME])
+                            del pcm_accumulator[:BYTES_PER_OPUS_FRAME]
+
+                            encoded_packet = self.encoder.encode(frame_bytes, SAMPLES_PER_FRAME)
+
+                            try:
+                                self._packet_queue.put_nowait(encoded_packet)
+                            except queue.Full:
+                                try:
+                                    self._packet_queue.get_nowait()
+                                    self._packet_queue.put_nowait(encoded_packet)
+                                except (queue.Empty, queue.Full):
+                                    pass
+
+                    except Exception:
+                        stream_failed_event.set()
+                        return (None, pyaudio.paAbort)
+
                     return (None, pyaudio.paContinue)
 
                 try:
-                    audio_data = np.frombuffer(in_data, dtype=np.float32)
-                    if audio_data.size == 0:
-                        return (None, pyaudio.paContinue)
+                    self.stream = self.audio_interface.open(
+                        format=pyaudio.paFloat32,
+                        channels=in_channels,
+                        rate=in_rate,
+                        input=True,
+                        input_device_index=loopback_device["index"],
+                        frames_per_buffer=1024,
+                        stream_callback=audio_callback,
+                    )
+                except Exception as open_err:
+                    self.status_text = "Device busy, switching..."
+                    time.sleep(0.8)
+                    continue
 
-                    audio_data = audio_data.reshape(-1, in_channels)
+                self.is_running = True
+                self.status_text = f"Broadcasting ({clean_name})"
+                self.stream.start_stream()
 
-                    if downmix_matrix is None:
-                        stereo = audio_data
-                    elif downmix_matrix == "slice":
-                        stereo = audio_data[:, :2]
+                # Stream Monitor & Hot-Plug Watchdog Loop
+                while self.stream.is_active() and not self._stop_event.is_set() and not stream_failed_event.is_set():
+                    # Periodically check if Windows changed default audio output device
+                    try:
+                        wasapi_check = self.audio_interface.get_host_api_info_by_type(pyaudio.paWASAPI)
+                        new_default_index = wasapi_check.get("defaultOutputDevice", -1)
+                        if new_default_index != -1 and new_default_index != active_device_index:
+                            self.status_text = "Sound device changed, adapting..."
+                            break  # Trigger clean recovery and switch to new device
+                    except Exception:
+                        break
+
+                    if self.is_paused:
+                        self.status_text = "Paused"
                     else:
-                        stereo = audio_data @ downmix_matrix
+                        self.status_text = f"Broadcasting ({clean_name})"
 
-                    if in_rate != self.target_rate:
-                        ext_stereo = np.vstack((prev_samples, stereo))
-                        step = in_rate / self.target_rate
-                        num_out = int(np.floor((len(stereo) - phase_acc) / step))
+                    self._stop_event.wait(timeout=0.8)
 
-                        if num_out > 0:
-                            indices = phase_acc + np.arange(num_out, dtype=np.float32) * step
-                            i_floor = indices.astype(np.int32)
-                            frac = (indices - i_floor).reshape(-1, 1)
-
-                            stereo_resampled = (1.0 - frac) * ext_stereo[i_floor] + frac * ext_stereo[i_floor + 1]
-                            phase_acc = float(indices[-1] + step - len(stereo))
-                        else:
-                            phase_acc -= len(stereo)
-                            return (None, pyaudio.paContinue)
-
-                        prev_samples = ext_stereo[-1:]
-                    else:
-                        stereo_resampled = stereo
-
-                    stereo_clamped = np.clip(stereo_resampled, -1.0, 1.0)
-                    pcm_bytes = (stereo_clamped * 32767.0).astype(np.int16).tobytes()
-
-                    pcm_accumulator.extend(pcm_bytes)
-
-                    while len(pcm_accumulator) >= BYTES_PER_OPUS_FRAME:
-                        frame_bytes = bytes(pcm_accumulator[:BYTES_PER_OPUS_FRAME])
-                        del pcm_accumulator[:BYTES_PER_OPUS_FRAME]
-
-                        encoded_packet = self.encoder.encode(frame_bytes, SAMPLES_PER_FRAME)
-
-                        try:
-                            self._packet_queue.put_nowait(encoded_packet)
-                        except queue.Full:
-                            try:
-                                self._packet_queue.get_nowait()
-                                self._packet_queue.put_nowait(encoded_packet)
-                            except (queue.Empty, queue.Full):
-                                pass
-
-                except Exception:
-                    return (None, pyaudio.paAbort)
-
-                return (None, pyaudio.paContinue)
-
-            self.stream = self.audio_interface.open(
-                format=pyaudio.paFloat32,
-                channels=in_channels,
-                rate=in_rate,
-                input=True,
-                input_device_index=loopback_device["index"],
-                frames_per_buffer=1024,
-                stream_callback=audio_callback,
-            )
-
-            self.is_running = True
-            self.status_text = "Broadcasting"
-            self.stream.start_stream()
-
-            while self.stream.is_active() and not self._stop_event.is_set():
-                if self.is_paused:
-                    self.status_text = "Paused"
-                else:
-                    self.status_text = "Broadcasting"
-                self._stop_event.wait(timeout=0.8)
-
-        except Exception as e:
-            self.status_text = f"Error: {e}"
+        except Exception:
+            # Let uncaught exceptions bubble up to show_fatal_crash_dialog
+            raise
         finally:
-            self._cleanup()
+            self._cleanup_audio_session()
+            self._cleanup_network()
 
 
 def _render_icon(color: str) -> Image.Image:
