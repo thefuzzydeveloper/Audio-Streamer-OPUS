@@ -130,6 +130,7 @@ To customize or compile the binaries yourself:
 - **Zero Dropouts:** Powered by the Opus audio codec over UDP to ensure smooth playback even on busy Wi-Fi networks.
 - **Smart Audio Conversion:** Automatically converts multi-channel surround sound (5.1/7.1) into clean, high-quality stereo audio with full bass preservation.
 - **Low Resource Usage:** Runs quietly in the background without eating up your CPU or draining your phone battery.
-- **System Tray Controls:** Easy one-click access to pause, restart, or enable auto-start on Windows boot.****
-- **Extremely light-weight** Android apk is few Kbs, and highly optimized
-- **Better alternative of other apps in same category** - No licence verification, payment, or data collection, full privacy!
+- **System Tray Controls:** Easy one-click access to pause, restart, or enable auto-start on Windows boot.
+- **Extremely light-weight** Android package is few Kbs, and highly optimized
+- **Better alternative of other apps in same category** - No license verification, payment, or data collection, full privacy!
+- **Better than Bluetooth headsets** - Lower latency than unreliable Bluetooth network 
