@@ -25,6 +25,7 @@ public class AudioService extends Service {
 
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
+    private WifiManager.MulticastLock multicastLock;
     private boolean isRunning = false;
 
     @Override
@@ -59,16 +60,22 @@ public class AudioService extends Service {
             wakeLock.acquire();
         }
 
-        // Enforce full low-latency Wi-Fi lock if buffer < 20ms or if explicitly requested
-        boolean needWifiLock = wifiHighPerf || (bufferMs < 20);
-        if (needWifiLock) {
-            WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-            if (wm != null && wifiLock == null) {
+        WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        if (wm != null) {
+            // Multicast lock is required to allow Android to receive broadcast UDP packets
+            if (multicastLock == null) {
+                multicastLock = wm.createMulticastLock("OpusPlayer::MulticastLock");
+                multicastLock.setReferenceCounted(false);
+                multicastLock.acquire();
+            }
+
+            if (wifiLock == null) {
                 int mode = WifiManager.WIFI_MODE_FULL_HIGH_PERF;
                 if (Build.VERSION.SDK_INT >= 29) {
                     mode = WifiManager.WIFI_MODE_FULL_LOW_LATENCY;
                 }
                 wifiLock = wm.createWifiLock(mode, "OpusPlayer::LowLatencyWifiLock");
+                wifiLock.setReferenceCounted(false);
                 wifiLock.acquire();
             }
         }
@@ -83,7 +90,7 @@ public class AudioService extends Service {
                 ? new Notification.Builder(this, CHANNEL_ID)
                 : new Notification.Builder(this);
 
-        String info = "Buffer: " + bufferMs + "ms" + (needWifiLock ? " | Low-Latency Wi-Fi" : "");
+        String info = "Buffer: " + bufferMs + "ms | Low-Latency Wi-Fi Active";
         Notification notification = builder
                 .setContentTitle("Opus Audio Receiver Active")
                 .setContentText(info)
@@ -110,6 +117,11 @@ public class AudioService extends Service {
         if (wakeLock != null && wakeLock.isHeld()) {
             wakeLock.release();
             wakeLock = null;
+        }
+
+        if (multicastLock != null && multicastLock.isHeld()) {
+            multicastLock.release();
+            multicastLock = null;
         }
 
         if (wifiLock != null && wifiLock.isHeld()) {

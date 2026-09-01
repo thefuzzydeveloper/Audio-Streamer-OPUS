@@ -7,6 +7,7 @@
 #include <string.h>
 #include <errno.h>
 #include <pthread.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -22,7 +23,7 @@
 #define CHANNELS 2
 #define OPUS_MAX_FRAME_SAMPLES 960  // 20ms @ 48kHz
 #define CHUNK_SAMPLES 480           // 10ms audio slice
-#define RING_BUFFER_SIZE 19200      // 400ms buffer capacity
+#define RING_BUFFER_SIZE 28800      // 600ms buffer capacity
 
 typedef struct {
     int16_t left;
@@ -58,8 +59,8 @@ static OpusDecoder *g_opus_decoder = NULL;
 static void ring_buffer_write(const AudioSample *src, int count) {
     pthread_mutex_lock(&g_mutex);
 
-    // Prevent clock drift / accumulation beyond target + 40ms
-    int max_allowed = g_target_buffer_samples + 1920;
+    // Prevent excessive drift accumulation beyond target + 80ms
+    int max_allowed = g_target_buffer_samples + 3840;
     if (max_allowed > RING_BUFFER_SIZE) max_allowed = RING_BUFFER_SIZE;
 
     while (g_buffered_samples + count > max_allowed) {
@@ -91,7 +92,7 @@ static void ring_buffer_read(AudioSample *dest, int count) {
         return;
     }
 
-    // Full frame available
+    // Normal path: Buffer has enough samples
     if (g_buffered_samples >= count) {
         for (int i = 0; i < count; i++) {
             dest[i] = g_ring_buf[g_read_idx];
@@ -103,18 +104,27 @@ static void ring_buffer_read(AudioSample *dest, int count) {
         return;
     }
 
-    // Partial underrun: play remaining available samples and bridge the rest with silence
+    // Transient Underrun: Output remaining samples and apply soft linear fade-out
     int available = g_buffered_samples;
     for (int i = 0; i < available; i++) {
         dest[i] = g_ring_buf[g_read_idx];
         g_read_idx = (g_read_idx + 1) % RING_BUFFER_SIZE;
     }
+
+    if (available > 0) {
+        // Smoothly fade out the tail to prevent clicking
+        for (int i = 0; i < available; i++) {
+            float gain = 1.0f - ((float)i / (float)available);
+            dest[i].left = (int16_t)(dest[i].left * gain);
+            dest[i].right = (int16_t)(dest[i].right * gain);
+        }
+    }
     memset(&dest[available], 0, (count - available) * sizeof(AudioSample));
     g_buffered_samples = 0;
     g_consecutive_underruns++;
 
-    // Only reset prebuffering if the stream completely stops (>150ms of pure silence)
-    if (g_consecutive_underruns > 15) {
+    // Only drop into full rebuffering state if the stream halts completely for > 500ms
+    if (g_consecutive_underruns > 50) {
         g_prebuffered = 0;
     }
 
@@ -132,6 +142,9 @@ static void bqPlayerCallback(SLAndroidSimpleBufferQueueItf bq, void *context) {
 }
 
 static void *udp_receiver_thread(void *arg) {
+    // Elevate thread priority on Android Linux kernel
+    setpriority(PRIO_PROCESS, 0, -16);
+
     uint8_t rx_buf[2048];
     AudioSample decoded_pcm[OPUS_MAX_FRAME_SAMPLES];
 
@@ -139,7 +152,25 @@ static void *udp_receiver_thread(void *arg) {
 
     while (g_running) {
         ssize_t n = recvfrom(g_sock_fd, rx_buf, sizeof(rx_buf), 0, NULL, NULL);
-        if (n <= 0) continue;
+        if (n <= 0) {
+            if (g_running && errno != EAGAIN && errno != EWOULDBLOCK) {
+                // If a packet was missed/lost during an outage, invoke Opus Packet Loss Concealment (PLC)
+                if (g_opus_decoder && g_prebuffered) {
+                    int plc_samples = opus_decode(
+                        g_opus_decoder,
+                        NULL,
+                        0,
+                        (opus_int16 *)decoded_pcm,
+                        OPUS_MAX_FRAME_SAMPLES,
+                        0
+                    );
+                    if (plc_samples > 0) {
+                        ring_buffer_write(decoded_pcm, plc_samples);
+                    }
+                }
+            }
+            continue;
+        }
 
         int decoded_samples = opus_decode(
             g_opus_decoder,
@@ -258,7 +289,7 @@ Java_com_example_opusplayer_NativeAudio_startAudio(JNIEnv *env, jclass clazz, ji
     int opt = 1;
     setsockopt(g_sock_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    int rcvbuf = 262144;
+    int rcvbuf = 524288; // 512KB socket buffer
     setsockopt(g_sock_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
     struct sockaddr_in address;
