@@ -1,0 +1,8 @@
+numpy
+opus_1
+opuslib
+Pillow
+PyAudioWPatch
+pystray
+python-xlib
+six

@@ -1,0 +1,16 @@
+{
+    "APP_NAME": "Audio Streamer",
+    "MAIN_SCRIPT": "audio_streamer.py",
+    "ATTACH_CONSOLE": false,
+    "ISOLATED_BUILD_DIR": "F:/Coding/dist/Audio Streamer/build_env",
+    "DIST_DIR": "F:/Coding/dist/Audio Streamer/dist",
+    "engine": "nuitka_hybrid",
+    "folder_prefs": {},
+    "selected_files": [],
+    "auto_fix_cycles": true,
+    "fixed_cycle_files": [],
+    "ICON_FILE": null,
+    "PRESERVE_UPDATER": true,
+    "STRIP_METADATA": true,
+    "UPDATER_SCRIPT": ""
+}
