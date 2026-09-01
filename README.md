@@ -2,7 +2,7 @@
 
 # Audio Streamer (Opus)
 
-Stream your Windows PC sound directly to your Android device over Wi-Fi with ultra-low delay. Ideal for watching videos, gaming, or using your phone as wireless headphones without annoying audio lag.
+Stream your Windows PC sound directly to your Android device over Wi-Fi with ultra-low delay. Ideal for watching videos, gaming, or using your phone as wireless headphones without annoying audio lag. 
 
 ## Quick Start (Recommended)
 
@@ -131,3 +131,5 @@ To customize or compile the binaries yourself:
 - **Smart Audio Conversion:** Automatically converts multi-channel surround sound (5.1/7.1) into clean, high-quality stereo audio with full bass preservation.
 - **Low Resource Usage:** Runs quietly in the background without eating up your CPU or draining your phone battery.
 - **System Tray Controls:** Easy one-click access to pause, restart, or enable auto-start on Windows boot.****
+- **Extremely light-weight** Android apk is few Kbs, and highly optimized
+- **Better alternative of other apps in same category** - No licence verification, payment, or data collection, full privacy!
