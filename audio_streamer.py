@@ -1,7 +1,5 @@
-import os
-import sys
+import os, sys
 
-# Register DLL directory for both standard Python and PyInstaller onefile bundles
 _BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
 if hasattr(os, "add_dll_directory") and os.path.isdir(_BASE_DIR):
     try:
@@ -13,40 +11,26 @@ os.environ["PATH"] = _BASE_DIR + os.pathsep + os.environ.get("PATH", "")
 import ctypes
 from ctypes import wintypes
 
-# ---------------------------------------------------------
-# Single Instance Guard (Win32 Named Mutex)
-# ---------------------------------------------------------
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 CreateMutexW = kernel32.CreateMutexW
 CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
 CreateMutexW.restype = wintypes.HANDLE
 
-MUTEX_NAME = "Local\\AndroidAudioStreamer_SingleInstance_Mutex_9921"
+MUTEX_NAME = "Local\\AndroidAudioStreamer_Clean_9927"
 _SINGLE_INSTANCE_MUTEX = CreateMutexW(None, False, MUTEX_NAME)
-if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+if kernel32.GetLastError() == 183:
     sys.exit(0)
 
-import queue
-import re
-import socket
-import subprocess
-import threading
-import time
-import winreg
-import numpy as np
-import opuslib
-import pyaudiowpatch as pyaudio
-import pystray
+import queue, socket, subprocess,threading, time, winreg, numpy as np, opuslib, pyaudiowpatch as pyaudio, pystray
 from PIL import Image, ImageDraw
 
 APP_NAME = "AndroidAudioStreamer"
-PORT = 12345
+DEFAULT_AUDIO_PORT = 12345
 TARGET_SAMPLE_RATE = 48000
 OPUS_FRAME_DURATION_MS = 20  # 20ms = 960 samples @ 48kHz
 SAMPLES_PER_FRAME = int(TARGET_SAMPLE_RATE * (OPUS_FRAME_DURATION_MS / 1000.0))
-BYTES_PER_OPUS_FRAME = SAMPLES_PER_FRAME * 2 * 2  # 960 frames * 2 channels * 2 bytes
+BYTES_PER_OPUS_FRAME = SAMPLES_PER_FRAME * 2 * 2
 OPUS_BITRATE = 128000
-
 
 def is_startup_enabled() -> bool:
     try:
@@ -83,36 +67,24 @@ def set_startup(enable: bool):
     winreg.CloseKey(key)
 
 
-def get_android_wifi_ip() -> str:
+def get_single_broadcast_target():
+    """Identifies the single best subnet broadcast address to eliminate packet multiplication/echo."""
+    subnets = set()
     try:
-        res = subprocess.run(
-            ["adb", "shell", "ip route"],
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
-        for line in res.stdout.splitlines():
-            if "wlan" in line and "src" in line:
-                parts = line.split()
-                if "src" in parts:
-                    return parts[parts.index("src") + 1]
-
-        res = subprocess.run(
-            ["adb", "shell", "ip addr show wlan0"],
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
-        match = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", res.stdout)
-        if match:
-            return match.group(1)
+        hostname = socket.gethostname()
+        for ip in socket.gethostbyname_ex(hostname)[2]:
+            if not ip.startswith("127.") and not ip.startswith("169.254."):
+                parts = ip.split(".")
+                if len(parts) == 4:
+                    subnets.add(f"{parts[0]}.{parts[1]}.{parts[2]}.255")
     except Exception:
         pass
-    return None
+
+    return list(subnets) if subnets else ["255.255.255.255"]
 
 
-class AudioStreamer:
-    def __init__(self, port=PORT, target_rate=TARGET_SAMPLE_RATE):
+class MultiDeviceAudioStreamer:
+    def __init__(self, port=DEFAULT_AUDIO_PORT, target_rate=TARGET_SAMPLE_RATE):
         self.port = port
         self.target_rate = target_rate
         self.is_paused = False
@@ -122,9 +94,8 @@ class AudioStreamer:
         self._stop_event = threading.Event()
         self._worker_thread = None
         self._sender_thread = None
-        self._packet_queue = queue.Queue(maxsize=16)
+        self._packet_queue = queue.Queue(maxsize=8)
 
-        self.player_proc = None
         self.udp_sock = None
         self.audio_interface = None
         self.stream = None
@@ -151,7 +122,7 @@ class AudioStreamer:
 
     def toggle_pause(self):
         self.is_paused = not self.is_paused
-        self.status_text = "Paused" if self.is_paused else "Streaming"
+        self.status_text = "Paused" if self.is_paused else "Broadcasting"
 
     def _cleanup(self):
         self.is_running = False
@@ -178,58 +149,43 @@ class AudioStreamer:
                 pass
             self.udp_sock = None
 
-        if self.player_proc:
-            try:
-                self.player_proc.kill()
-            except Exception:
-                pass
-            self.player_proc = None
-
         while not self._packet_queue.empty():
             try:
                 self._packet_queue.get_nowait()
             except queue.Empty:
                 break
 
-        subprocess.run(
-            ["adb", "shell", "killall -9 audio_player 2>/dev/null; exit 0"],
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
+    def _network_sender_loop(self):
+        targets = get_single_broadcast_target()
+        last_refresh = time.time()
 
-    def _network_sender_loop(self, target_ip):
         while not self._stop_event.is_set():
             try:
                 payload = self._packet_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
 
-            try:
-                if self.udp_sock:
+            if self.is_paused or not self.udp_sock:
+                continue
+
+            if time.time() - last_refresh > 10.0:
+                targets = get_single_broadcast_target()
+                last_refresh = time.time()
+
+            for target_ip in targets:
+                try:
                     self.udp_sock.sendto(payload, (target_ip, self.port))
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
     def _run_streamer(self):
         try:
-            self.status_text = "Locating Phone..."
-            phone_ip = get_android_wifi_ip()
-            if not phone_ip:
-                self.status_text = "Error: Wi-Fi IP not found"
-                return
-
-            self.status_text = "Starting Engine..."
+            # Prevent double-audio: kill any rogue standalone binary on USB devices
             subprocess.run(
                 ["adb", "shell", "killall -9 audio_player 2>/dev/null; exit 0"],
+                capture_output=True,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
-
-            self.player_proc = subprocess.Popen(
-                ["adb", "shell", f"/data/local/tmp/audio_player {self.port}"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-            )
-            time.sleep(0.4)
 
             self.encoder = opuslib.Encoder(
                 self.target_rate, 2, opuslib.APPLICATION_AUDIO
@@ -237,10 +193,12 @@ class AudioStreamer:
             self.encoder.bitrate = OPUS_BITRATE
 
             self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+            self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
+            self.udp_sock.setblocking(False)
 
             self._sender_thread = threading.Thread(
-                target=self._network_sender_loop, args=(phone_ip,), daemon=True
+                target=self._network_sender_loop, daemon=True
             )
             self._sender_thread.start()
 
@@ -264,32 +222,29 @@ class AudioStreamer:
             in_rate = int(loopback_device["defaultSampleRate"])
             in_channels = loopback_device["maxInputChannels"]
 
-            # Vectorized Matrix Setup for Multichannel Downmixing
             if in_channels == 1:
                 downmix_matrix = np.array([[1.0, 1.0]], dtype=np.float32)
             elif in_channels == 2:
-                downmix_matrix = None  # Direct stereo pass-through
+                downmix_matrix = None
             elif in_channels == 6:
-                # 5.1 Downmixing Matrix
                 downmix_matrix = np.array([
-                    [0.5,    0.0],     # FL
-                    [0.0,    0.5],     # FR
-                    [0.3535, 0.3535],  # FC (0.5 * 0.707)
-                    [0.5,    0.5],     # LFE
-                    [0.3535, 0.0],     # SL
-                    [0.0,    0.3535],  # SR
+                    [0.5,    0.0],
+                    [0.0,    0.5],
+                    [0.3535, 0.3535],
+                    [0.5,    0.5],
+                    [0.3535, 0.0],
+                    [0.0,    0.3535],
                 ], dtype=np.float32)
             elif in_channels == 8:
-                # 7.1 Downmixing Matrix
                 downmix_matrix = np.array([
-                    [0.45,   0.0],     # FL
-                    [0.0,    0.45],    # FR
-                    [0.318,  0.318],   # FC (0.45 * 0.707)
-                    [0.45,   0.45],    # LFE
-                    [0.318,  0.0],     # SL
-                    [0.0,    0.318],   # SR
-                    [0.318,  0.0],     # BL
-                    [0.0,    0.318],   # BR
+                    [0.45,   0.0],
+                    [0.0,    0.45],
+                    [0.318,  0.318],
+                    [0.45,   0.45],
+                    [0.318,  0.0],
+                    [0.0,    0.318],
+                    [0.318,  0.0],
+                    [0.0,    0.318],
                 ], dtype=np.float32)
             else:
                 downmix_matrix = "slice"
@@ -305,6 +260,8 @@ class AudioStreamer:
                     return (None, pyaudio.paAbort)
 
                 if self.is_paused:
+                    if len(pcm_accumulator) > 0:
+                        pcm_accumulator.clear()
                     return (None, pyaudio.paContinue)
 
                 try:
@@ -314,7 +271,6 @@ class AudioStreamer:
 
                     audio_data = audio_data.reshape(-1, in_channels)
 
-                    # 1. Fast Vectorized Downmix
                     if downmix_matrix is None:
                         stereo = audio_data
                     elif downmix_matrix == "slice":
@@ -322,7 +278,6 @@ class AudioStreamer:
                     else:
                         stereo = audio_data @ downmix_matrix
 
-                    # 2. Resampling (Bypassed if native 48kHz)
                     if in_rate != self.target_rate:
                         ext_stereo = np.vstack((prev_samples, stereo))
                         step = in_rate / self.target_rate
@@ -343,11 +298,9 @@ class AudioStreamer:
                     else:
                         stereo_resampled = stereo
 
-                    # 3. Direct Fast Vectorized PCM Conversion
                     stereo_clamped = np.clip(stereo_resampled, -1.0, 1.0)
                     pcm_bytes = (stereo_clamped * 32767.0).astype(np.int16).tobytes()
 
-                    # 4. Opus Encoding & Frame Dispatch
                     pcm_accumulator.extend(pcm_bytes)
 
                     while len(pcm_accumulator) >= BYTES_PER_OPUS_FRAME:
@@ -381,11 +334,15 @@ class AudioStreamer:
             )
 
             self.is_running = True
-            self.status_text = f"Streaming to {phone_ip}"
+            self.status_text = "Broadcasting"
             self.stream.start_stream()
 
             while self.stream.is_active() and not self._stop_event.is_set():
-                self._stop_event.wait(timeout=0.5)
+                if self.is_paused:
+                    self.status_text = "Paused"
+                else:
+                    self.status_text = "Broadcasting"
+                self._stop_event.wait(timeout=0.8)
 
         except Exception as e:
             self.status_text = f"Error: {e}"
@@ -404,20 +361,14 @@ def _render_icon(color: str) -> Image.Image:
     }
     fill = colors.get(color, "#2ECC71")
 
-    # Outer badge frame
     draw.rounded_rectangle([2, 2, 62, 62], radius=14, fill=(18, 22, 32, 255), outline=fill, width=3)
-
-    # Mini speaker geometry
     draw.rectangle([12, 24, 22, 40], fill=fill)
     draw.polygon([(22, 24), (36, 13), (36, 51), (22, 40)], fill=fill)
-
-    # Radiating acoustic arcs
     draw.arc([26, 21, 46, 43], start=-50, end=50, fill=fill, width=3)
     draw.arc([22, 13, 56, 51], start=-50, end=50, fill=fill, width=3)
     return image
 
 
-# Pre-render icons at startup to avoid runtime draw calls
 CACHED_ICONS = {
     "green": _render_icon("green"),
     "yellow": _render_icon("yellow"),
@@ -426,7 +377,7 @@ CACHED_ICONS = {
 
 
 class TrayApp:
-    def __init__(self, streamer: AudioStreamer):
+    def __init__(self, streamer: MultiDeviceAudioStreamer):
         self.streamer = streamer
         self.icon = None
         self._last_icon_color = None
@@ -460,7 +411,6 @@ class TrayApp:
 
         status = self.streamer.status_text
 
-        # Update only on actual state transition
         if color != self._last_icon_color:
             self.icon.icon = CACHED_ICONS[color]
             self._last_icon_color = color
@@ -512,6 +462,6 @@ class TrayApp:
 
 
 if __name__ == "__main__":
-    streamer = AudioStreamer()
+    streamer = MultiDeviceAudioStreamer()
     app = TrayApp(streamer)
     app.run()

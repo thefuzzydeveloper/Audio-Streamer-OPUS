@@ -182,3 +182,4 @@ cython_debug/
 /opus-1.5.2
 /build
 /nppBackup
+/opus_android_app/nppBackup
