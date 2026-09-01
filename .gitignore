@@ -181,3 +181,4 @@ cython_debug/
 .cursorindexingignore
 /opus-1.5.2
 /build
+/nppBackup
