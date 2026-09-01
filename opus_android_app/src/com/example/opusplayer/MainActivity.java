@@ -23,36 +23,21 @@ public class MainActivity extends Activity {
     private static final int PORT = 12345;
     private static final String PREFS_NAME = "OpusPlayerSettings";
     private static final String KEY_BUFFER_MS = "key_buffer_ms";
-    private static final String KEY_LOW_CPU = "key_low_cpu";
     private static final String KEY_WIFI_LOCK = "key_wifi_lock";
 
     private static boolean isServiceRunning = false;
     private SharedPreferences prefs;
 
-    private int bufferMs = 20;
-    private boolean lowCpu = true;
+    private int bufferMs = 20; // 20ms matches exactly 1 Opus frame from streamer.py
     private boolean wifiHighPerf = true;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Load saved preferences
         prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         bufferMs = prefs.getInt(KEY_BUFFER_MS, 20);
-        if (bufferMs < 5) bufferMs = 5;
-        if (bufferMs > 50) bufferMs = 50;
-
-        lowCpu = prefs.getBoolean(KEY_LOW_CPU, true);
         wifiHighPerf = prefs.getBoolean(KEY_WIFI_LOCK, true);
-
-        // Auto-enforce rules on initial load
-        if (bufferMs < 10) {
-            lowCpu = false;
-        }
-        if (bufferMs < 20) {
-            wifiHighPerf = true;
-        }
 
         requestAppPermissions();
 
@@ -62,7 +47,7 @@ public class MainActivity extends Activity {
         layout.setPadding(48, 48, 48, 48);
 
         final TextView titleText = new TextView(this);
-        titleText.setText("Opus Low-Latency Receiver");
+        titleText.setText("Opus Clean Stream Receiver");
         titleText.setTextSize(22);
         titleText.setGravity(Gravity.CENTER);
         titleText.setPadding(0, 0, 0, 24);
@@ -75,23 +60,10 @@ public class MainActivity extends Activity {
         statusText.setPadding(0, 0, 0, 24);
         layout.addView(statusText);
 
-        final CheckBox lowCpuCheck = new CheckBox(this);
-        lowCpuCheck.setText("Low CPU Mode (Zero Standby / Sleep on Silence)");
-        lowCpuCheck.setChecked(lowCpu);
-        lowCpuCheck.setEnabled(bufferMs >= 10);
-        lowCpuCheck.setPadding(0, 0, 0, 16);
-        lowCpuCheck.setOnCheckedChangeListener((buttonView, isChecked) -> {
-            if (bufferMs >= 10) {
-                lowCpu = isChecked;
-                savePreferences();
-            }
-        });
-        layout.addView(lowCpuCheck);
-
         final CheckBox wifiHighPerfCheck = new CheckBox(this);
         wifiHighPerfCheck.setText("Force Wi-Fi Low Latency Lock");
         wifiHighPerfCheck.setChecked(wifiHighPerf);
-        wifiHighPerfCheck.setPadding(0, 0, 0, 24);
+        wifiHighPerfCheck.setPadding(0, 0, 0, 20);
         wifiHighPerfCheck.setOnCheckedChangeListener((buttonView, isChecked) -> {
             wifiHighPerf = isChecked;
             savePreferences();
@@ -102,43 +74,16 @@ public class MainActivity extends Activity {
         updateBufferLabel(bufferLabel);
         layout.addView(bufferLabel);
 
-        // SeekBar constrained strictly to 5ms - 50ms
         final SeekBar bufferBar = new SeekBar(this);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            bufferBar.setMin(5);
-            bufferBar.setMax(50);
-            bufferBar.setProgress(bufferMs);
-        } else {
-            bufferBar.setMax(45); // 0 to 45 (+5 offset)
-            bufferBar.setProgress(bufferMs - 5);
-        }
-
+        bufferBar.setMax(500); // 10ms to 500ms
+        bufferBar.setProgress(bufferMs);
         bufferBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    bufferMs = Math.max(10, Math.min(50, progress));
-                } else {
-                    bufferMs = Math.max(10, Math.min(50, progress + 10));
-                }
-
-                if (bufferMs < 10) {
-                    lowCpu = false;
-                    lowCpuCheck.setChecked(false);
-                    lowCpuCheck.setEnabled(false);
-                } else {
-                    lowCpuCheck.setEnabled(true);
-                }
-
-                if (bufferMs < 20) {
-                    wifiHighPerf = true;
-                    wifiHighPerfCheck.setChecked(true);
-                }
-
+                bufferMs = Math.max(10, progress);
                 updateBufferLabel(bufferLabel);
                 savePreferences();
 
-                // Push real-time buffer update to active native audio engine
                 if (isServiceRunning) {
                     NativeAudio.setBufferMs(bufferMs);
                 }
@@ -147,8 +92,32 @@ public class MainActivity extends Activity {
             @Override public void onStartTrackingTouch(SeekBar seekBar) {}
             @Override public void onStopTrackingTouch(SeekBar seekBar) {}
         });
-        bufferBar.setPadding(0, 16, 0, 32);
+        bufferBar.setPadding(0, 16, 0, 24);
         layout.addView(bufferBar);
+
+        // Quick Preset Buttons
+        LinearLayout presetLayout = new LinearLayout(this);
+        presetLayout.setOrientation(LinearLayout.HORIZONTAL);
+        presetLayout.setGravity(Gravity.CENTER);
+        presetLayout.setPadding(0, 0, 0, 24);
+
+        final Button btnUltraLow = new Button(this);
+        btnUltraLow.setText("Fast Wi-Fi (20ms)");
+        btnUltraLow.setOnClickListener(v -> {
+            bufferMs = 20;
+            bufferBar.setProgress(20);
+        });
+        presetLayout.addView(btnUltraLow);
+
+        final Button btnSafe = new Button(this);
+        btnSafe.setText("Weak Wi-Fi (150ms)");
+        btnSafe.setOnClickListener(v -> {
+            bufferMs = 150;
+            bufferBar.setProgress(150);
+        });
+        presetLayout.addView(btnSafe);
+
+        layout.addView(presetLayout);
 
         final Button toggleButton = new Button(this);
         toggleButton.setText(isServiceRunning ? "Stop Receiver" : "Start Receiver");
@@ -157,7 +126,6 @@ public class MainActivity extends Activity {
                 Intent startIntent = new Intent(this, AudioService.class);
                 startIntent.setAction(AudioService.ACTION_START);
                 startIntent.putExtra(AudioService.EXTRA_PORT, PORT);
-                startIntent.putExtra(AudioService.EXTRA_LOW_CPU, lowCpu);
                 startIntent.putExtra(AudioService.EXTRA_BUFFER_MS, bufferMs);
                 startIntent.putExtra(AudioService.EXTRA_WIFI_HIGH_PERF, wifiHighPerf);
 
@@ -191,20 +159,14 @@ public class MainActivity extends Activity {
     }
 
     private void updateBufferLabel(TextView label) {
-        String note = "";
-        if (bufferMs < 10) {
-            note = " (Ultra-Low Latency: Low CPU Off, Wi-Fi Lock On)";
-        } else if (bufferMs < 20) {
-            note = " (Auto Wi-Fi Lock Active)";
-        }
-        label.setText("Jitter Buffer: " + bufferMs + " ms" + note);
+        String description = (bufferMs <= 30) ? " (Optimal Low-Latency)" : " (Safe Buffer)";
+        label.setText("Buffer: " + bufferMs + " ms" + description);
     }
 
     private void savePreferences() {
         if (prefs != null) {
             prefs.edit()
                  .putInt(KEY_BUFFER_MS, bufferMs)
-                 .putBoolean(KEY_LOW_CPU, lowCpu)
                  .putBoolean(KEY_WIFI_LOCK, wifiHighPerf)
                  .apply();
         }

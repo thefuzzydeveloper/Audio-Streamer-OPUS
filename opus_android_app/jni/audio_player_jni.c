@@ -23,7 +23,7 @@
 #define CHANNELS 2
 #define OPUS_MAX_FRAME_SAMPLES 960  // 20ms @ 48kHz
 #define CHUNK_SAMPLES 480           // 10ms audio slice
-#define RING_BUFFER_SIZE 28800      // 600ms buffer capacity
+#define RING_BUFFER_SIZE 192000     // 4000ms buffer capacity
 
 typedef struct {
     int16_t left;
@@ -39,8 +39,10 @@ static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_sock_fd = -1;
 static volatile int g_running = 0;
 static volatile int g_prebuffered = 0;
-static int g_consecutive_underruns = 0;
-static int g_target_buffer_samples = 1440; // Default 30ms
+
+// Increased default baseline buffer to 60ms to absorb Wi-Fi roaming jitter
+static int g_target_buffer_samples = 2880; // 60ms @ 48kHz
+static int g_max_drift_samples = 5760;     // 120ms max drift limit
 
 static pthread_t g_rx_thread;
 static int g_listen_port = 12345;
@@ -56,16 +58,19 @@ static AudioSample g_play_buffers[2][CHUNK_SAMPLES];
 static int g_play_buf_idx = 0;
 static OpusDecoder *g_opus_decoder = NULL;
 
-static void ring_buffer_write(const AudioSample *src, int count) {
-    pthread_mutex_lock(&g_mutex);
+// Packet sequence tracking for Loss Concealment (PLC)
+static int g_has_first_seq = 0;
+static uint16_t g_last_seq = 0;
 
-    // Prevent excessive drift accumulation beyond target + 80ms
-    int max_allowed = g_target_buffer_samples + 3840;
+static void ring_buffer_write_locked(const AudioSample *src, int count) {
+    int max_allowed = g_target_buffer_samples + g_max_drift_samples;
     if (max_allowed > RING_BUFFER_SIZE) max_allowed = RING_BUFFER_SIZE;
 
+    // Smoothly advance read index if network burst exceeds max drift headroom
     while (g_buffered_samples + count > max_allowed) {
-        g_read_idx = (g_read_idx + CHUNK_SAMPLES) % RING_BUFFER_SIZE;
-        g_buffered_samples -= CHUNK_SAMPLES;
+        g_read_idx = (g_read_idx + count) % RING_BUFFER_SIZE;
+        g_buffered_samples -= count;
+        if (g_buffered_samples < 0) g_buffered_samples = 0;
     }
 
     for (int i = 0; i < count; i++) {
@@ -76,35 +81,37 @@ static void ring_buffer_write(const AudioSample *src, int count) {
 
     if (!g_prebuffered && g_buffered_samples >= g_target_buffer_samples) {
         g_prebuffered = 1;
-        g_consecutive_underruns = 0;
     }
+}
 
+static void ring_buffer_write(const AudioSample *src, int count) {
+    pthread_mutex_lock(&g_mutex);
+    ring_buffer_write_locked(src, count);
     pthread_mutex_unlock(&g_mutex);
 }
 
 static void ring_buffer_read(AudioSample *dest, int count) {
     pthread_mutex_lock(&g_mutex);
 
-    // Initial startup buffering gate
+    // Initial buffering / rebuffering gate
     if (!g_prebuffered) {
         memset(dest, 0, count * sizeof(AudioSample));
         pthread_mutex_unlock(&g_mutex);
         return;
     }
 
-    // Normal path: Buffer has enough samples
+    // Normal continuous playback path
     if (g_buffered_samples >= count) {
         for (int i = 0; i < count; i++) {
             dest[i] = g_ring_buf[g_read_idx];
             g_read_idx = (g_read_idx + 1) % RING_BUFFER_SIZE;
         }
         g_buffered_samples -= count;
-        g_consecutive_underruns = 0;
         pthread_mutex_unlock(&g_mutex);
         return;
     }
 
-    // Transient Underrun: Output remaining samples and apply soft linear fade-out
+    // Underrun condition: drain remaining samples with smooth fade-out
     int available = g_buffered_samples;
     for (int i = 0; i < available; i++) {
         dest[i] = g_ring_buf[g_read_idx];
@@ -112,7 +119,6 @@ static void ring_buffer_read(AudioSample *dest, int count) {
     }
 
     if (available > 0) {
-        // Smoothly fade out the tail to prevent clicking
         for (int i = 0; i < available; i++) {
             float gain = 1.0f - ((float)i / (float)available);
             dest[i].left = (int16_t)(dest[i].left * gain);
@@ -121,12 +127,9 @@ static void ring_buffer_read(AudioSample *dest, int count) {
     }
     memset(&dest[available], 0, (count - available) * sizeof(AudioSample));
     g_buffered_samples = 0;
-    g_consecutive_underruns++;
 
-    // Only drop into full rebuffering state if the stream halts completely for > 500ms
-    if (g_consecutive_underruns > 50) {
-        g_prebuffered = 0;
-    }
+    // Immediately reset prebuffer flag to stop oscillation and wait for cushion
+    g_prebuffered = 0;
 
     pthread_mutex_unlock(&g_mutex);
 }
@@ -142,20 +145,36 @@ static void bqPlayerCallback(SLAndroidSimpleBufferQueueItf bq, void *context) {
 }
 
 static void *udp_receiver_thread(void *arg) {
-    // Elevate thread priority on Android Linux kernel
-    setpriority(PRIO_PROCESS, 0, -16);
+    setpriority(PRIO_PROCESS, 0, -19); // Real-time priority
 
     uint8_t rx_buf[2048];
     AudioSample decoded_pcm[OPUS_MAX_FRAME_SAMPLES];
 
-    LOGI("Audio UDP receiver active on port %d", g_listen_port);
+    LOGI("Audio UDP receiver listening on port %d", g_listen_port);
 
     while (g_running) {
         ssize_t n = recvfrom(g_sock_fd, rx_buf, sizeof(rx_buf), 0, NULL, NULL);
-        if (n <= 0) {
-            if (g_running && errno != EAGAIN && errno != EWOULDBLOCK) {
-                // If a packet was missed/lost during an outage, invoke Opus Packet Loss Concealment (PLC)
-                if (g_opus_decoder && g_prebuffered) {
+        if (n <= 2) {
+            continue;
+        }
+
+        // Extract 2-byte big-endian sequence number
+        uint16_t seq = ((uint16_t)rx_buf[0] << 8) | (uint16_t)rx_buf[1];
+        uint8_t *opus_payload = rx_buf + 2;
+        opus_int32 payload_len = (opus_int32)(n - 2);
+
+        pthread_mutex_lock(&g_mutex);
+
+        if (!g_has_first_seq) {
+            g_has_first_seq = 1;
+            g_last_seq = seq;
+        } else {
+            int diff = (int)seq - (int)g_last_seq;
+            if (diff < 0) diff += 65536;
+
+            // Handle packet loss using Opus Packet Loss Concealment (PLC)
+            if (diff > 1 && diff <= 5) {
+                for (int lost = 1; lost < diff; lost++) {
                     int plc_samples = opus_decode(
                         g_opus_decoder,
                         NULL,
@@ -165,25 +184,28 @@ static void *udp_receiver_thread(void *arg) {
                         0
                     );
                     if (plc_samples > 0) {
-                        ring_buffer_write(decoded_pcm, plc_samples);
+                        ring_buffer_write_locked(decoded_pcm, plc_samples);
                     }
                 }
             }
-            continue;
+            g_last_seq = seq;
         }
 
+        // Decode actual Opus frame
         int decoded_samples = opus_decode(
             g_opus_decoder,
-            rx_buf,
-            (opus_int32)n,
+            opus_payload,
+            payload_len,
             (opus_int16 *)decoded_pcm,
             OPUS_MAX_FRAME_SAMPLES,
             0
         );
 
         if (decoded_samples > 0) {
-            ring_buffer_write(decoded_pcm, decoded_samples);
+            ring_buffer_write_locked(decoded_pcm, decoded_samples);
         }
+
+        pthread_mutex_unlock(&g_mutex);
     }
     return NULL;
 }
@@ -223,26 +245,28 @@ static void stop_audio_engine() {
     g_write_idx = 0;
     g_read_idx = 0;
     g_buffered_samples = 0;
-    g_consecutive_underruns = 0;
+    g_has_first_seq = 0;
     pthread_mutex_unlock(&g_mutex);
 
-    LOGI("Audio engine stopped.");
+    LOGI("Audio engine stopped cleanly.");
 }
 
 JNIEXPORT jboolean JNICALL
 Java_com_example_opusplayer_NativeAudio_startAudio(JNIEnv *env, jclass clazz, jint port, jboolean lowCpu, jint bufferMs) {
     if (g_running) return JNI_TRUE;
 
-    if (bufferMs < 10) bufferMs = 10;
-    if (bufferMs > 50) bufferMs = 50;
-
     g_listen_port = port;
+
+    if (bufferMs < 30) bufferMs = 60; // 60ms recommended minimum baseline for Wi-Fi
+    if (bufferMs > 1000) bufferMs = 1000;
+
     g_target_buffer_samples = (SAMPLE_RATE * bufferMs) / 1000;
+    g_max_drift_samples = (SAMPLE_RATE * (bufferMs > 100 ? bufferMs : 100)) / 1000;
 
     int opus_err = 0;
     g_opus_decoder = opus_decoder_create(SAMPLE_RATE, CHANNELS, &opus_err);
     if (opus_err != OPUS_OK) {
-        LOGE("Failed to init Opus decoder: %s", opus_strerror(opus_err));
+        LOGE("Opus decoder creation failed: %s", opus_strerror(opus_err));
         return JNI_FALSE;
     }
 
@@ -289,7 +313,7 @@ Java_com_example_opusplayer_NativeAudio_startAudio(JNIEnv *env, jclass clazz, ji
     int opt = 1;
     setsockopt(g_sock_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    int rcvbuf = 524288; // 512KB socket buffer
+    int rcvbuf = 2097152; // 2MB socket buffer
     setsockopt(g_sock_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
     struct sockaddr_in address;
@@ -308,7 +332,7 @@ Java_com_example_opusplayer_NativeAudio_startAudio(JNIEnv *env, jclass clazz, ji
     g_read_idx = 0;
     g_buffered_samples = 0;
     g_prebuffered = 0;
-    g_consecutive_underruns = 0;
+    g_has_first_seq = 0;
     g_running = 1;
 
     pthread_create(&g_rx_thread, NULL, udp_receiver_thread, NULL);
@@ -317,11 +341,12 @@ Java_com_example_opusplayer_NativeAudio_startAudio(JNIEnv *env, jclass clazz, ji
 
 JNIEXPORT void JNICALL
 Java_com_example_opusplayer_NativeAudio_setBufferMs(JNIEnv *env, jclass clazz, jint bufferMs) {
-    if (bufferMs < 10) bufferMs = 10;
-    if (bufferMs > 50) bufferMs = 50;
+    if (bufferMs < 30) bufferMs = 60;
+    if (bufferMs > 1000) bufferMs = 1000;
 
     pthread_mutex_lock(&g_mutex);
     g_target_buffer_samples = (SAMPLE_RATE * bufferMs) / 1000;
+    g_max_drift_samples = (SAMPLE_RATE * (bufferMs > 100 ? bufferMs : 100)) / 1000;
     pthread_mutex_unlock(&g_mutex);
 }
 

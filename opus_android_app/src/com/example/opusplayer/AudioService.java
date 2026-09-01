@@ -16,7 +16,6 @@ public class AudioService extends Service {
     public static final String ACTION_START = "com.example.opusplayer.START";
     public static final String ACTION_STOP = "com.example.opusplayer.STOP";
     public static final String EXTRA_PORT = "EXTRA_PORT";
-    public static final String EXTRA_LOW_CPU = "EXTRA_LOW_CPU";
     public static final String EXTRA_BUFFER_MS = "EXTRA_BUFFER_MS";
     public static final String EXTRA_WIFI_HIGH_PERF = "EXTRA_WIFI_HIGH_PERF";
 
@@ -41,11 +40,10 @@ public class AudioService extends Service {
         String action = intent.getAction();
         if (ACTION_START.equals(action) && !isRunning) {
             int port = intent.getIntExtra(EXTRA_PORT, 12345);
-            boolean lowCpu = intent.getBooleanExtra(EXTRA_LOW_CPU, true);
-            int bufferMs = intent.getIntExtra(EXTRA_BUFFER_MS, 50);
-            boolean wifiHighPerf = intent.getBooleanExtra(EXTRA_WIFI_HIGH_PERF, false);
+            int bufferMs = intent.getIntExtra(EXTRA_BUFFER_MS, 20);
+            boolean wifiHighPerf = intent.getBooleanExtra(EXTRA_WIFI_HIGH_PERF, true);
 
-            startAudioPlayback(port, lowCpu, bufferMs, wifiHighPerf);
+            startAudioPlayback(port, bufferMs, wifiHighPerf);
         } else if (ACTION_STOP.equals(action)) {
             stopAudioPlayback();
         }
@@ -53,7 +51,7 @@ public class AudioService extends Service {
         return START_NOT_STICKY;
     }
 
-    private void startAudioPlayback(int port, boolean lowCpu, int bufferMs, boolean wifiHighPerf) {
+    private void startAudioPlayback(int port, int bufferMs, boolean wifiHighPerf) {
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
         if (pm != null && wakeLock == null) {
             wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "OpusPlayer::CpuLock");
@@ -62,14 +60,13 @@ public class AudioService extends Service {
 
         WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
         if (wm != null) {
-            // Multicast lock is required to allow Android to receive broadcast UDP packets
             if (multicastLock == null) {
                 multicastLock = wm.createMulticastLock("OpusPlayer::MulticastLock");
                 multicastLock.setReferenceCounted(false);
                 multicastLock.acquire();
             }
 
-            if (wifiLock == null) {
+            if (wifiLock == null && wifiHighPerf) {
                 int mode = WifiManager.WIFI_MODE_FULL_HIGH_PERF;
                 if (Build.VERSION.SDK_INT >= 29) {
                     mode = WifiManager.WIFI_MODE_FULL_LOW_LATENCY;
@@ -90,10 +87,9 @@ public class AudioService extends Service {
                 ? new Notification.Builder(this, CHANNEL_ID)
                 : new Notification.Builder(this);
 
-        String info = "Buffer: " + bufferMs + "ms | Low-Latency Wi-Fi Active";
         Notification notification = builder
-                .setContentTitle("Opus Audio Receiver Active")
-                .setContentText(info)
+                .setContentTitle("Opus Clean Stream Active")
+                .setContentText("Buffer: " + bufferMs + " ms | Wi-Fi Lock Active")
                 .setSmallIcon(R.drawable.ic_launcher)
                 .setContentIntent(pendingIntent)
                 .setOngoing(true)
@@ -105,7 +101,7 @@ public class AudioService extends Service {
             startForeground(NOTIFICATION_ID, notification);
         }
 
-        NativeAudio.startAudio(port, lowCpu, bufferMs);
+        NativeAudio.startAudio(port, false, bufferMs);
         isRunning = true;
     }
 
