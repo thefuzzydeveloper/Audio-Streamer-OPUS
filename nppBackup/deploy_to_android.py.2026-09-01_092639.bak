@@ -1,8 +1,5 @@
-import glob
-import os
-import shutil
-import subprocess
-import sys
+import glob, os, shutil, subprocess, sys
+from pathlib import Path
 from pathlib import Path
 
 # Enable ANSI colors on Windows console
@@ -175,8 +172,8 @@ def main():
 
     # 1. Terminate running instances
     run_command(
-        'adb shell "killall -9 audio_player 2>/dev/null; pkill -9 -f audio_player 2>/dev/null; exit 0"',
-        "Terminating running audio_player instances on Android...",
+        'adb shell "killall -9 grab_event audio_player 2>/dev/null; pkill -9 -f grab_event 2>/dev/null; pkill -9 -f audio_player 2>/dev/null; exit 0"',
+        "Terminating running instances on Android...",
         critical=False,
     )
 
@@ -184,7 +181,15 @@ def main():
     setup_include_tree()
     libopus_a = build_libopus()
 
-    # 3. Compile audio_player.c with statically linked Opus and OpenSL ES
+    # 3. Compile grab_event.c (if present)
+    if Path("grab_event.c").exists():
+        run_command(
+            [str(NDK_CLANG), "grab_event.c", "-O3", "-s", "-o", "grab_event"],
+            "Compiling grab_event.c...",
+        )
+        log_success("grab_event compiled successfully.")
+
+    # 4. Compile audio_player.c with statically linked Opus and OpenSL ES
     if not Path("audio_player.c").exists():
         log_error("audio_player.c not found in current directory.")
         sys.exit(1)
@@ -206,20 +211,23 @@ def main():
     )
     log_success("audio_player compiled successfully.")
 
-    # 4. Push binary to Android
-    run_command(
-        ["adb", "push", "audio_player", f"{REMOTE_DIR}/audio_player"],
-        f"Pushing audio_player -> {REMOTE_DIR}/audio_player...",
-    )
+    # 5. Push binaries to Android
+    files_to_push = [f for f in ["grab_event", "audio_player"] if Path(f).exists()]
+    for binary in files_to_push:
+        run_command(
+            ["adb", "push", binary, f"{REMOTE_DIR}/{binary}"],
+            f"Pushing {binary} -> {REMOTE_DIR}/{binary}...",
+        )
 
-    # 5. Set executable permissions
+    # 6. Set executable permissions
+    remote_paths = " ".join([f"{REMOTE_DIR}/{b}" for b in files_to_push])
     run_command(
-        f'adb shell "chmod 755 {REMOTE_DIR}/audio_player"',
-        "Setting executable permissions (chmod 755)...",
+        f'adb shell "chmod 755 {remote_paths}"',
+        f"Setting executable permissions (chmod 755)...",
     )
 
     print(f"\n{GREEN}{BOLD}" + "=" * 60)
-    print("  DEPLOYMENT COMPLETE: audio_player binary active")
+    print("  DEPLOYMENT COMPLETE: Opus + OpenSL ES binaries active")
     print("=" * 60 + f"{RESET}\n")
 
 
