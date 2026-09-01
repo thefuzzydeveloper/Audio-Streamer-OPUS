@@ -31,9 +31,19 @@ This project is an ultra-low-latency, headless wireless audio streaming solution
 
 # Follow along GUIDE
 
-### OPTION 1: COMPLETE END-USER SETUP & USAGE (RUNNING PRE-COMPILED BINARIES)
+### OPTION 1: ZERO DEVELOPER SETUP
 
-Use this method to run the pre-built application without installing the Android NDK, C compilers, or building Opus from source.
+Install android apk and installer for windows everything works automatically (no IP addresses or further setup needed!)
+
+----
+
+**Installation of android apk** - The Opus Streamer is distributed OUTSIDE google playstore, thereby it is recommended to scan the app (for security) before installation.
+
+---
+
+### OPTION 2: COMPLETE END-USER SETUP & USAGE (RUNNING PRE-COMPILED BINARIES)
+
+Use this method to run the pre-built application without installing the Android NDK, C compilers, or building Opus from source. (in case you do not want to install the apk and use streaming permanently - remember this method needs to be done again after reboot (depending upon device), software updates, and anything that wipes off /tmp/ in android
 
 ---
 
@@ -212,7 +222,7 @@ Audio Streamer\dist\Audio Streamer\
 
 ---
 
-### OPTION 2: DEVELOPER PIPELINE (BUILDING & PACKAGING FROM SOURCE)
+### OPTION 3: DEVELOPER PIPELINE (BUILDING & PACKAGING FROM SOURCE)
 
 Use this method to modify the native C receiver engine, compile the Opus codec from source for ARM64, modify the Python capture logic, and compile a standalone Windows executable.
 
