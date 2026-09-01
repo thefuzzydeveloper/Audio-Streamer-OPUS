@@ -17,8 +17,8 @@ Get up and running in less than two minutes without dealing with command lines o
 
 1. Install and open the **OpusPlayer app** on your Android phone.
 2. Install and launch **Audio Streamer** on your Windows PC.
-3. Make sure both devices are on the **same Wi-Fi network**.
-4. The app connects automatically and starts streaming your desktop sound immediately.
+3. Make sure both devices are on the **same Wi-Fi network** (in case wifi is not available, connect your PC with android phone hotspot).
+4. In the app, click on start receiver and it connects automatically and starts streaming your desktop sound immediately.
 
 ## Alternative Setup: Standalone ADB Mode
 
