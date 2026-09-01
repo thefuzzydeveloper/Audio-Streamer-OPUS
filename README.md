@@ -133,4 +133,6 @@ To customize or compile the binaries yourself:
 - **System Tray Controls:** Easy one-click access to pause, restart, or enable auto-start on Windows boot.
 - **Extremely light-weight** Android package is few Kbs, and highly optimized
 - **Better alternative of other apps in same category** - No license verification, payment, or data collection, full privacy!
-- **Better than Bluetooth headsets** - Lower latency than unreliable Bluetooth network 
+- **Better than Bluetooth headsets** - Lower latency than unreliable Bluetooth network
+
+--> Expect audio lag for first few minutes till audio buffer builds up! Audio should clear up as the buffer builds up
