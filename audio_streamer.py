@@ -10,6 +10,22 @@ if hasattr(os, "add_dll_directory") and os.path.isdir(_BASE_DIR):
         pass
 os.environ["PATH"] = _BASE_DIR + os.pathsep + os.environ.get("PATH", "")
 
+import ctypes
+from ctypes import wintypes
+
+# ---------------------------------------------------------
+# Single Instance Guard (Win32 Named Mutex)
+# ---------------------------------------------------------
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+CreateMutexW = kernel32.CreateMutexW
+CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+CreateMutexW.restype = wintypes.HANDLE
+
+MUTEX_NAME = "Local\\AndroidAudioStreamer_SingleInstance_Mutex_9921"
+_SINGLE_INSTANCE_MUTEX = CreateMutexW(None, False, MUTEX_NAME)
+if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+    sys.exit(0)
+
 import queue
 import re
 import socket
@@ -28,7 +44,8 @@ PORT = 12345
 TARGET_SAMPLE_RATE = 48000
 OPUS_FRAME_DURATION_MS = 20  # 20ms = 960 samples @ 48kHz
 SAMPLES_PER_FRAME = int(TARGET_SAMPLE_RATE * (OPUS_FRAME_DURATION_MS / 1000.0))
-OPUS_BITRATE = 128000        # 128 kbps stereo (crystal clear, low packet size)
+BYTES_PER_OPUS_FRAME = SAMPLES_PER_FRAME * 2 * 2  # 960 frames * 2 channels * 2 bytes
+OPUS_BITRATE = 128000
 
 
 def is_startup_enabled() -> bool:
@@ -67,7 +84,6 @@ def set_startup(enable: bool):
 
 
 def get_android_wifi_ip() -> str:
-    """Extracts Android device's Wi-Fi IP address via ADB."""
     try:
         res = subprocess.run(
             ["adb", "shell", "ip route"],
@@ -81,7 +97,6 @@ def get_android_wifi_ip() -> str:
                 if "src" in parts:
                     return parts[parts.index("src") + 1]
 
-        # Secondary fallback
         res = subprocess.run(
             ["adb", "shell", "ip addr show wlan0"],
             capture_output=True,
@@ -122,14 +137,14 @@ class AudioStreamer:
 
     def restart(self):
         self.stop()
-        time.sleep(0.5)
+        time.sleep(0.3)
         self.start()
 
     def stop(self):
         self._stop_event.set()
         self._cleanup()
         if self._worker_thread and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=2.0)
+            self._worker_thread.join(timeout=1.5)
         if self._sender_thread and self._sender_thread.is_alive():
             self._sender_thread.join(timeout=1.0)
         self.status_text = "Stopped"
@@ -184,7 +199,7 @@ class AudioStreamer:
     def _network_sender_loop(self, target_ip):
         while not self._stop_event.is_set():
             try:
-                payload = self._packet_queue.get(timeout=0.1)
+                payload = self._packet_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
 
@@ -214,7 +229,7 @@ class AudioStreamer:
                 stderr=subprocess.DEVNULL,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
-            time.sleep(0.5)
+            time.sleep(0.4)
 
             self.encoder = opuslib.Encoder(
                 self.target_rate, 2, opuslib.APPLICATION_AUDIO
@@ -249,15 +264,42 @@ class AudioStreamer:
             in_rate = int(loopback_device["defaultSampleRate"])
             in_channels = loopback_device["maxInputChannels"]
 
-            pcm_accumulator = bytearray()
-            bytes_per_opus_frame = SAMPLES_PER_FRAME * 2 * 2  # 960 frames * 2 ch * 2 bytes
+            # Vectorized Matrix Setup for Multichannel Downmixing
+            if in_channels == 1:
+                downmix_matrix = np.array([[1.0, 1.0]], dtype=np.float32)
+            elif in_channels == 2:
+                downmix_matrix = None  # Direct stereo pass-through
+            elif in_channels == 6:
+                # 5.1 Downmixing Matrix
+                downmix_matrix = np.array([
+                    [0.5,    0.0],     # FL
+                    [0.0,    0.5],     # FR
+                    [0.3535, 0.3535],  # FC (0.5 * 0.707)
+                    [0.5,    0.5],     # LFE
+                    [0.3535, 0.0],     # SL
+                    [0.0,    0.3535],  # SR
+                ], dtype=np.float32)
+            elif in_channels == 8:
+                # 7.1 Downmixing Matrix
+                downmix_matrix = np.array([
+                    [0.45,   0.0],     # FL
+                    [0.0,    0.45],    # FR
+                    [0.318,  0.318],   # FC (0.45 * 0.707)
+                    [0.45,   0.45],    # LFE
+                    [0.318,  0.0],     # SL
+                    [0.0,    0.318],   # SR
+                    [0.318,  0.0],     # BL
+                    [0.0,    0.318],   # BR
+                ], dtype=np.float32)
+            else:
+                downmix_matrix = "slice"
 
+            pcm_accumulator = bytearray()
             phase_acc = 0.0
-            prev_sample_l = 0.0
-            prev_sample_r = 0.0
+            prev_samples = np.zeros((1, 2), dtype=np.float32)
 
             def audio_callback(in_data, frame_count, time_info, status):
-                nonlocal phase_acc, prev_sample_l, prev_sample_r, pcm_accumulator
+                nonlocal phase_acc, prev_samples, pcm_accumulator
 
                 if self._stop_event.is_set():
                     return (None, pyaudio.paAbort)
@@ -272,73 +314,45 @@ class AudioStreamer:
 
                     audio_data = audio_data.reshape(-1, in_channels)
 
-                    if in_channels == 1:
-                        left = audio_data[:, 0]
-                        right = audio_data[:, 0]
-                    elif in_channels == 2:
-                        left = audio_data[:, 0]
-                        right = audio_data[:, 1]
-                    elif in_channels >= 6:
-                        fl = audio_data[:, 0]
-                        fr = audio_data[:, 1]
-                        fc = audio_data[:, 2]
-                        lfe = audio_data[:, 3]
-                        sl = audio_data[:, 4]
-                        sr = audio_data[:, 5]
-
-                        if in_channels >= 8:
-                            bl = audio_data[:, 6]
-                            br = audio_data[:, 7]
-                            left = (fl + 0.707 * fc + lfe + 0.707 * sl + 0.707 * bl) * 0.45
-                            right = (fr + 0.707 * fc + lfe + 0.707 * sr + 0.707 * br) * 0.45
-                        else:
-                            left = (fl + 0.707 * fc + lfe + 0.707 * sl) * 0.5
-                            right = (fr + 0.707 * fc + lfe + 0.707 * sr) * 0.5
+                    # 1. Fast Vectorized Downmix
+                    if downmix_matrix is None:
+                        stereo = audio_data
+                    elif downmix_matrix == "slice":
+                        stereo = audio_data[:, :2]
                     else:
-                        left = audio_data[:, 0]
-                        right = audio_data[:, 1]
+                        stereo = audio_data @ downmix_matrix
 
+                    # 2. Resampling (Bypassed if native 48kHz)
                     if in_rate != self.target_rate:
-                        ext_left = np.concatenate(([prev_sample_l], left))
-                        ext_right = np.concatenate(([prev_sample_r], right))
-
+                        ext_stereo = np.vstack((prev_samples, stereo))
                         step = in_rate / self.target_rate
-                        num_out = int(np.floor((len(left) - phase_acc) / step))
+                        num_out = int(np.floor((len(stereo) - phase_acc) / step))
 
                         if num_out > 0:
-                            indices = phase_acc + np.arange(num_out) * step
+                            indices = phase_acc + np.arange(num_out, dtype=np.float32) * step
                             i_floor = indices.astype(np.int32)
-                            frac = (indices - i_floor).astype(np.float32)
+                            frac = (indices - i_floor).reshape(-1, 1)
 
-                            left = (1.0 - frac) * ext_left[i_floor] + frac * ext_left[i_floor + 1]
-                            right = (1.0 - frac) * ext_right[i_floor] + frac * ext_right[i_floor + 1]
-
-                            phase_acc = float(indices[-1] + step - len(left))
+                            stereo_resampled = (1.0 - frac) * ext_stereo[i_floor] + frac * ext_stereo[i_floor + 1]
+                            phase_acc = float(indices[-1] + step - len(stereo))
                         else:
-                            phase_acc -= len(left)
+                            phase_acc -= len(stereo)
                             return (None, pyaudio.paContinue)
 
-                        prev_sample_l = float(ext_left[-1])
-                        prev_sample_r = float(ext_right[-1])
+                        prev_samples = ext_stereo[-1:]
                     else:
-                        prev_sample_l = float(left[-1])
-                        prev_sample_r = float(right[-1])
+                        stereo_resampled = stereo
 
-                    left = np.clip(left, -1.0, 1.0)
-                    right = np.clip(right, -1.0, 1.0)
+                    # 3. Direct Fast Vectorized PCM Conversion
+                    stereo_clamped = np.clip(stereo_resampled, -1.0, 1.0)
+                    pcm_bytes = (stereo_clamped * 32767.0).astype(np.int16).tobytes()
 
-                    pcm_l = (left * 32767.0).astype(np.int16)
-                    pcm_r = (right * 32767.0).astype(np.int16)
+                    # 4. Opus Encoding & Frame Dispatch
+                    pcm_accumulator.extend(pcm_bytes)
 
-                    stereo_pcm = np.empty((len(pcm_l) * 2,), dtype=np.int16)
-                    stereo_pcm[0::2] = pcm_l
-                    stereo_pcm[1::2] = pcm_r
-
-                    pcm_accumulator.extend(stereo_pcm.tobytes())
-
-                    while len(pcm_accumulator) >= bytes_per_opus_frame:
-                        frame_bytes = bytes(pcm_accumulator[:bytes_per_opus_frame])
-                        del pcm_accumulator[:bytes_per_opus_frame]
+                    while len(pcm_accumulator) >= BYTES_PER_OPUS_FRAME:
+                        frame_bytes = bytes(pcm_accumulator[:BYTES_PER_OPUS_FRAME])
+                        del pcm_accumulator[:BYTES_PER_OPUS_FRAME]
 
                         encoded_packet = self.encoder.encode(frame_bytes, SAMPLES_PER_FRAME)
 
@@ -371,7 +385,7 @@ class AudioStreamer:
             self.stream.start_stream()
 
             while self.stream.is_active() and not self._stop_event.is_set():
-                time.sleep(0.2)
+                self._stop_event.wait(timeout=0.5)
 
         except Exception as e:
             self.status_text = f"Error: {e}"
@@ -379,7 +393,7 @@ class AudioStreamer:
             self._cleanup()
 
 
-def create_tray_icon_image(color="green"):
+def _render_icon(color: str) -> Image.Image:
     size = (64, 64)
     image = Image.new("RGBA", size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
@@ -403,10 +417,20 @@ def create_tray_icon_image(color="green"):
     return image
 
 
+# Pre-render icons at startup to avoid runtime draw calls
+CACHED_ICONS = {
+    "green": _render_icon("green"),
+    "yellow": _render_icon("yellow"),
+    "red": _render_icon("red"),
+}
+
+
 class TrayApp:
     def __init__(self, streamer: AudioStreamer):
         self.streamer = streamer
         self.icon = None
+        self._last_icon_color = None
+        self._last_status_text = None
 
     def on_pause_toggle(self, icon, item):
         self.streamer.toggle_pause()
@@ -417,8 +441,7 @@ class TrayApp:
         self.update_tray()
 
     def on_toggle_startup(self, icon, item):
-        currently_enabled = is_startup_enabled()
-        set_startup(not currently_enabled)
+        set_startup(not is_startup_enabled())
 
     def on_exit(self, icon, item):
         self.streamer.stop()
@@ -427,13 +450,24 @@ class TrayApp:
     def update_tray(self):
         if not self.icon:
             return
+
         if not self.streamer.is_running:
-            self.icon.icon = create_tray_icon_image("red")
+            color = "red"
         elif self.streamer.is_paused:
-            self.icon.icon = create_tray_icon_image("yellow")
+            color = "yellow"
         else:
-            self.icon.icon = create_tray_icon_image("green")
-        self.icon.title = f"Android Audio Streamer ({self.streamer.status_text})"
+            color = "green"
+
+        status = self.streamer.status_text
+
+        # Update only on actual state transition
+        if color != self._last_icon_color:
+            self.icon.icon = CACHED_ICONS[color]
+            self._last_icon_color = color
+
+        if status != self._last_status_text:
+            self.icon.title = f"Android Audio Streamer ({status})"
+            self._last_status_text = status
 
     def run(self):
         self.streamer.start()
@@ -463,7 +497,7 @@ class TrayApp:
 
         self.icon = pystray.Icon(
             APP_NAME,
-            icon=create_tray_icon_image("green"),
+            icon=CACHED_ICONS["green"],
             title=f"Android Audio Streamer ({self.streamer.status_text})",
             menu=menu,
         )
